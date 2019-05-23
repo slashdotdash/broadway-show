@@ -1,18 +1,17 @@
 defmodule BroadwayShow.Pipeline do
   use Broadway
 
-  import Integer
-
   alias Broadway.BatchInfo
   alias Broadway.Message
   alias BroadwayShow.Pipeline
 
-  def start_link(_opts) do
+  def start_link(opts) do
     Broadway.start_link(Pipeline,
       name: BroadwayShow.Pipeline,
+      context: opts,
       producers: [
         default: [
-          module: {BroadwayShow.Producer, []},
+          module: {BroadwayShow.Producer, opts},
           stages: 1
         ]
       ],
@@ -20,7 +19,7 @@ defmodule BroadwayShow.Pipeline do
         default: [stages: 1]
       ],
       batchers: [
-        default: [stages: 3, batch_size: 1]
+        default: [stages: 5, batch_size: 1]
       ]
     )
   end
@@ -31,18 +30,14 @@ defmodule BroadwayShow.Pipeline do
   end
 
   @impl Broadway
-  def handle_batch(_batcher, messages, %BatchInfo{} = batch_info, _context) do
-    [%Message{data: data} | _messages] = messages
-    %BatchInfo{batch_key: batch_key} = batch_info
+  def handle_batch(_batcher, messages, _batch_info, context) do
+    handle_data = Keyword.get(context, :handle_data)
 
-    log = inspect(self()) <> " [#{batch_key}] " <> String.pad_leading(inspect(data), 2)
-
-    if data == 10 do
-      IO.puts(log <> " x")
-      Enum.map(messages, &Message.failed(&1, :error))
-    else
-      IO.puts(log <> " ✓")
-      messages
+    for %Message{data: data} = message <- messages do
+      case handle_data.(data) do
+        :ok -> message
+        :error -> Message.failed(message, :error)
+      end
     end
   end
 end

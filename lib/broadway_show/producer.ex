@@ -7,28 +7,37 @@ defmodule BroadwayShow.Producer do
 
   use GenStage
 
+  require Logger
+
   alias Broadway.Message
 
   @behaviour Broadway.Acknowledger
   @behaviour Broadway.Producer
 
   defmodule State do
-    defstruct [:counter, :demand, :acks, :nacks, :status]
+    defstruct [:counter, :demand, :acks, :nacks, :opts, :status]
 
-    def new do
-      %State{counter: 0, demand: 0, acks: MapSet.new(), nacks: MapSet.new(), status: :running}
+    def new(opts) do
+      %State{
+        counter: 0,
+        demand: 0,
+        acks: MapSet.new(),
+        nacks: MapSet.new(),
+        opts: opts,
+        status: :running
+      }
     end
   end
 
   alias BroadwayShow.Producer.State
 
   @impl GenStage
-  def init(_opts) do
-    {:producer, State.new()}
+  def init(opts) do
+    {:producer, State.new(opts)}
   end
 
   @impl GenStage
-  def handle_demand(demand, %State{status: :running} = state) when demand > 0 do
+  def handle_demand(demand, %State{} = state) when demand > 0 do
     %State{demand: existing_demand} = state
 
     {events, state} = build_events(%State{state | demand: existing_demand + demand})
@@ -36,16 +45,10 @@ defmodule BroadwayShow.Producer do
     {:noreply, events, state}
   end
 
-  @impl GenStage
-  def handle_demand(_demand, %State{status: :stopped} = state) do
-    # Don't produce any more events when status is `:stopped`
-    {:noreply, [], state}
-  end
-
   @impl Broadway.Acknowledger
   def ack(pid, successful, failed) do
     send(pid, {:ack, Enum.map(successful, & &1.data)})
-    send(pid, {:nack, Enum.map(failed, & &1.data)})
+    send(pid, {:nack, Enum.map(failed, &{&1.data, &1.status})})
 
     :ok
   end
@@ -62,31 +65,54 @@ defmodule BroadwayShow.Producer do
   end
 
   @impl GenStage
-  def handle_info({:nack, []}, %State{} = state) do
-    {events, state} = build_events(state)
-
-    {:noreply, events, state}
-  end
-
   def handle_info({:nack, nack}, %State{} = state) do
     %State{nacks: nacks} = state
 
-    state = %State{state | nacks: Enum.reduce(nack, nacks, &MapSet.put(&2, &1)), status: :stopped}
+    state =
+      case nack do
+        [] ->
+          state
+
+        nack ->
+          %State{
+            state
+            | nacks: Enum.reduce(nack, nacks, &MapSet.put(&2, &1)),
+              status: status_on_error(state)
+          }
+      end
 
     {events, state} = build_events(state)
 
     {:noreply, events, state}
   end
 
+  defp status_on_error(%State{} = state) do
+    %State{opts: opts, status: status} = state
+
+    if Keyword.get(opts, :stop_on_error, false) do
+      Logger.warn(fn -> "Producer requested to stop on error" end)
+
+      :stopped
+    else
+      status
+    end
+  end
+
+  # No demand for events.
+  defp build_events(%State{demand: 0} = state), do: {[], state}
+
+  # Don't produce any more events when status is `:stopped`.
+  defp build_events(%State{status: :stopped} = state), do: {[], state}
+
   defp build_events(%State{} = state) do
-    %State{acks: acks, counter: counter, demand: demand} = state
+    %State{acks: acks, nacks: nacks, counter: counter, demand: demand} = state
 
     events =
-      counter..1000
+      counter..100
       |> Stream.filter(fn i ->
-        expected_ack = i - 5
+        previous = i - 5
 
-        expected_ack < 0 || MapSet.member?(acks, expected_ack)
+        previous < 0 || MapSet.member?(acks, previous) || MapSet.member?(nacks, previous)
       end)
       |> Stream.map(fn i ->
         %Message{
